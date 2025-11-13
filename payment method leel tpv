@@ -1,0 +1,12 @@
+select payment_method_type,
+count(distinct case when payment_attempt_id is not null or payment_attempt_id <> '' then payin_id end) as count_payins,
+sum(case 
+when invoice_currency in ('usd','USD')
+then toFloat64(customer_paid_amount_icy) / 100
+else toFloat64(customer_paid_amount_icy) * rate_in_icy_to_usd / 100
+end
+) as tpv_USD
+
+from payin 
+where toDate(payin_created_at) >= '2025-08-13' and payment_attempt_status = 'succeeded' and seller_email not like '%@tazapay.com' and payin_id not like 'col%'
+group by 1; 
