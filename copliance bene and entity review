@@ -1,0 +1,43 @@
+with base as (
+SELECT 
+    business_name,
+    beneficiary_id, 
+    beneficiary_name, 
+    destination_country,
+    SUM(
+        multiIf(
+            payout_created_at >= today() - INTERVAL 90 DAY AND payout_currency IN ('usd', 'USD'), 
+                payout_amount / 100.0,
+            payout_created_at >= today() - INTERVAL 90 DAY AND payout_currency IN ('btc','BTC'), 
+                (payout_amount / 100000000.0) * CAST(rate_in_pcy_to_usd AS Float64),
+            payout_created_at >= today() - INTERVAL 90 DAY,
+                (payout_amount / 100.0) * CAST(rate_in_pcy_to_usd AS Float64),
+            0
+        )
+    ) AS tpv
+FROM datamart_payout
+where payout_attempt_status = 'succeeded' and seller_email not like '%tazapay.com'
+
+GROUP BY 1, 2, 3,4
+order by 5 desc) 
+select * from base where tpv > 1000000
+
+
+select a.account_id, a.business_name, a.entity_id, c.display_name, b.country_code, c.industry, c.sub_industry,
+SUM(
+        multiIf(
+            payout_created_at >= today() - INTERVAL 90 DAY AND payout_currency IN ('usd', 'USD'), 
+                payout_amount / 100.0,
+            payout_created_at >= today() - INTERVAL 90 DAY AND payout_currency IN ('btc','BTC'), 
+                (payout_amount / 100000000.0) * CAST(rate_in_pcy_to_usd AS Float64),
+            payout_created_at >= today() - INTERVAL 90 DAY,
+                (payout_amount / 100.0) * CAST(rate_in_pcy_to_usd AS Float64),
+            0
+        )
+    ) AS tpv
+from datamart_payout  a 
+left join datalake.clean_entity b on a.entity_id = b.entity_id
+left join datalake.clean_entity_metadata c on a.entity_id = c.entity_id
+where payout_attempt_status = 'succeeded' and seller_email not like '%tazapay.com' and a.entity_id <> ''
+GROUP BY 1, 2, 3,4,5,6,7
+order by 5 desc
