@@ -1,4 +1,3 @@
--- how is both different ? 
 
 with payout_filtered as
 (
@@ -9,22 +8,31 @@ with payout_filtered as
   ),
 
     
-payout_attempt_t as (
+   payout_attempt_filtered as
+  (
+    SELECT
+        payout_attempt_id,
+        payout_id,
+        provider,
+        psp_reference_id,
+        row_number() OVER (PARTITION BY payout_id ORDER BY created_at asc) AS first_provider_filter,
+        row_number() OVER (PARTITION BY payout_id ORDER BY created_at DESC) AS final_provider_filter
+    FROM datalake.clean_payout_attempt
+    WHERE date(created_at)> DATE('2025-10-01')
+    ),
+    
+    
+payout_attempt_dm as (
   select 
   payout_attempt_id, payout_id, final_rail_used as provider, fund_transfer_network,  destination_currency,
   destination_amount ,rate_in_pcy_to_usd, payout_currency,payout_amount, beneficiary_id,
   ROW_NUMBER() OVER (PARTITION BY payout_id ORDER BY payout_created_at DESC) as row_num
   
-  from datamart_payout Where date(payout_created_at)> DATE('2025-11-01')
+  from datamart_payout 
+  Where date(payout_created_at)> DATE('2025-11-01')
     ), 
     
-    payout_attempt_filtered as (
-  select 
-  payout_attempt_id, payout_id, provider, fund_transfer_network, destination_currency, beneficiary_id,
-  destination_amount ,rate_in_pcy_to_usd, payout_currency,payout_amount
-  
-  from payout_attempt_t Where  row_num = 1
-    ), 
+    
     
 
 payout_attempt_transition_filtered as 
@@ -35,7 +43,7 @@ payout_attempt_transition_filtered as
         CASE WHEN created_by <> 'system' THEN 1 ELSE 0 END as manual_flag,
         created_at
       FROM datalake.clean_payout_attempt_status_transition
-      Where date(created_at)> DATE('2025-11-01')
+      -- Where date(created_at)> DATE('2025-11-01')
      ),
 
      transition_data as  
@@ -55,7 +63,7 @@ payout_attempt_transition_filtered as
         arrayFirst(x -> JSONExtractString(x, 'key') = 'bank_name', JSONExtractArrayRaw(bank_fields)),'value') as bank_name
     from 
     (select beneficiary, bank_id from datalake.clean_beneficiary_bank 
-    where beneficiary in (select beneficiary_id from payout_attempt_filtered)) a 
+    where beneficiary in (select beneficiary_id from payout_attempt_dm)) a 
     left join datalake.clean_bank b on a.bank_id = b.bank_id
     
     ), 
@@ -65,33 +73,42 @@ payout_attempt_transition_filtered as
    (
       Select
         a.payout_id as payout_id,
-        b.destination_currency,
+        
+        e.destination_currency,
         a.transfer_type,
         a.charge_type,
         a.status,
-        c.payout_attempt_id as payout_attempt_id,
+        b.payout_attempt_id as payout_attempt_id,
         c.auto_flag_sum,
         c.manual_flag_sum,
         c.start_date_1,
         c.end_date_1,
-        b.destination_amount,
-        b.fund_transfer_network as fund_transfer_network,
+        e.destination_amount,
+        e.fund_transfer_network as fund_transfer_network,
         d.bank_name,
-        b.payout_currency, 
-        b.payout_amount, 
-        b.rate_in_pcy_to_usd,
+        e.payout_currency, 
+        e.payout_amount, 
+        e.rate_in_pcy_to_usd,
+        first_provider_filter,
+        final_provider_filter,
         CASE
-    WHEN b.payout_currency in ('usd', 'USD') then b.payout_amount / 100.0
-   WHEN b.payout_currency in ('btc','BTC') then (payout_amount / 100000000.0) * cast(b.rate_in_pcy_to_usd as Float64)
-    ELSE (b.payout_amount / 100.0) * CAST(b.rate_in_pcy_to_usd AS Float64)
+    WHEN e.payout_currency in ('usd', 'USD') then e.payout_amount / 100.0
+   WHEN e.payout_currency in ('btc','BTC') then (e.payout_amount / 100000000.0) * cast(e.rate_in_pcy_to_usd as Float64)
+    ELSE (e.payout_amount / 100.0) * CAST(e.rate_in_pcy_to_usd AS Float64)
     END  as TPV_USD
       FROM payout_filtered a 
+      
       LEFT JOIN payout_attempt_filtered b 
       ON a.payout_id = b.payout_id
+      
+      left join payout_attempt_dm e 
+      on a.payout_id = e.payout_id 
+      
       LEFT JOIN transition_data c
       on b.payout_attempt_id = c.payout_attempt_id
+    
       left join bank_fetch d 
-      on b.beneficiary_id = d.beneficiary_id
+      on e.beneficiary_id = d.beneficiary_id
       ),
       
       final as (
@@ -105,6 +122,8 @@ payout_attempt_transition_filtered as
         charge_type,
         bank_name,
         TPV_USD,
+           first_provider_filter,
+        final_provider_filter,
          CASE 
             WHEN SUM(auto_flag_sum)> 0 AND SUM(manual_flag_sum)> 0 THEN 'both'
             WHEN SUM(auto_flag_sum)> 0 AND SUM(manual_flag_sum)= 0 THEN 'auto'
@@ -115,7 +134,7 @@ payout_attempt_transition_filtered as
         MAX(end_date_1) as end_date,
         dateDiff('second', MIN(start_date_1), MAX(end_date_1)) AS payout_tat
        FROM combined_data
-    Group by 1,2,3,4,5,6,7,8)
+    Group by 1,2,3,4,5,6,7,8,9,10)
     
     
     select 
@@ -147,6 +166,7 @@ payout_attempt_transition_filtered as
       else 'E: <= 1000'
       end as dest_amt_bucket
       from final 
+   
       
       
   
