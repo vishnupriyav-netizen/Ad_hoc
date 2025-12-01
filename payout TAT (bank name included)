@@ -1,0 +1,153 @@
+-- how is both different ? 
+
+with payout_filtered as
+(
+  SELECT 
+    *
+  FROM datalake.clean_payout
+  where date(created_at)> DATE('2025-11-01') AND status = 'succeeded'
+  ),
+
+    
+payout_attempt_t as (
+  select 
+  payout_attempt_id, payout_id, final_rail_used as provider, fund_transfer_network,  destination_currency,
+  destination_amount ,rate_in_pcy_to_usd, payout_currency,payout_amount, beneficiary_id,
+  ROW_NUMBER() OVER (PARTITION BY payout_id ORDER BY payout_created_at DESC) as row_num
+  
+  from datamart_payout Where date(payout_created_at)> DATE('2025-11-01')
+    ), 
+    
+    payout_attempt_filtered as (
+  select 
+  payout_attempt_id, payout_id, provider, fund_transfer_network, destination_currency, beneficiary_id,
+  destination_amount ,rate_in_pcy_to_usd, payout_currency,payout_amount
+  
+  from payout_attempt_t Where  row_num = 1
+    ), 
+    
+
+payout_attempt_transition_filtered as 
+(
+      SELECT
+        payout_attempt_id,
+        CASE WHEN created_by = 'system' THEN 1 ELSE 0 END as auto_flag,
+        CASE WHEN created_by <> 'system' THEN 1 ELSE 0 END as manual_flag,
+        created_at
+      FROM datalake.clean_payout_attempt_status_transition
+      Where date(created_at)> DATE('2025-11-01')
+     ),
+
+     transition_data as  
+     (
+     SELECT
+        payout_attempt_id,
+        SUM(auto_flag) as auto_flag_sum,
+        sum(manual_flag) as manual_flag_sum,
+        MIN(created_at) as start_date_1,
+        MAX(created_at) as end_date_1
+     FROM payout_attempt_transition_filtered
+     Group by 1 
+     ),
+     
+    bank_fetch as (
+    select a.beneficiary as beneficiary_id, a.bank_id, JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'bank_name', JSONExtractArrayRaw(bank_fields)),'value') as bank_name
+    from 
+    (select beneficiary, bank_id from datalake.clean_beneficiary_bank 
+    where beneficiary in (select beneficiary_id from payout_attempt_filtered)) a 
+    left join datalake.clean_bank b on a.bank_id = b.bank_id
+    
+    ), 
+    
+     
+   combined_data as 
+   (
+      Select
+        a.payout_id as payout_id,
+        b.destination_currency,
+        a.transfer_type,
+        a.charge_type,
+        a.status,
+        c.payout_attempt_id as payout_attempt_id,
+        c.auto_flag_sum,
+        c.manual_flag_sum,
+        c.start_date_1,
+        c.end_date_1,
+        b.destination_amount,
+        b.fund_transfer_network as fund_transfer_network,
+        d.bank_name,
+        b.payout_currency, 
+        b.payout_amount, 
+        b.rate_in_pcy_to_usd,
+        CASE
+    WHEN b.payout_currency in ('usd', 'USD') then b.payout_amount / 100.0
+   WHEN b.payout_currency in ('btc','BTC') then (payout_amount / 100000000.0) * cast(b.rate_in_pcy_to_usd as Float64)
+    ELSE (b.payout_amount / 100.0) * CAST(b.rate_in_pcy_to_usd AS Float64)
+    END  as TPV_USD
+      FROM payout_filtered a 
+      LEFT JOIN payout_attempt_filtered b 
+      ON a.payout_id = b.payout_id
+      LEFT JOIN transition_data c
+      on b.payout_attempt_id = c.payout_attempt_id
+      left join bank_fetch d 
+      on b.beneficiary_id = d.beneficiary_id
+      ),
+      
+      final as (
+      
+      select
+        payout_id,
+        destination_currency,
+        destination_amount,
+        fund_transfer_network,
+        transfer_type,
+        charge_type,
+        bank_name,
+        TPV_USD,
+         CASE 
+            WHEN SUM(auto_flag_sum)> 0 AND SUM(manual_flag_sum)> 0 THEN 'both'
+            WHEN SUM(auto_flag_sum)> 0 AND SUM(manual_flag_sum)= 0 THEN 'auto'
+            ELSE 'manual'
+        END as auto_manual,
+        COUNT(payout_attempt_id) as count_of_attempt,
+        MIN(start_date_1) as start_date,
+        MAX(end_date_1) as end_date,
+        dateDiff('second', MIN(start_date_1), MAX(end_date_1)) AS payout_tat
+       FROM combined_data
+    Group by 1,2,3,4,5,6,7,8)
+    
+    
+    select 
+    *,
+    CASE
+      WHEN payout_tat < 11 THEN 'A:0–10 seconds'
+      WHEN payout_tat < 31 THEN 'B:11–30 seconds'
+      WHEN payout_tat < 61 THEN 'C:31–60 seconds (≤1 min)'
+      WHEN payout_tat < 121 THEN 'D:1–2 minutes'
+      WHEN payout_tat < 301 THEN 'E:2–5 minutes'
+      WHEN payout_tat < 601 THEN 'F:5–10 minutes'
+      WHEN payout_tat < 1801 THEN 'G:10–30 minutes'
+      WHEN payout_tat < 3601 THEN 'H:30–60 minutes (≤1 hour)'
+      WHEN payout_tat < 7201 THEN 'I:1–2 hours'
+      WHEN payout_tat < 14401 THEN 'J:2–4 hours'
+      WHEN payout_tat < 28801 THEN 'K:4–8 hours'
+      WHEN payout_tat < 43201 THEN 'L:8–12 hours'
+      WHEN payout_tat < 86401 THEN 'M:12–24 hours (<1 day)'
+      WHEN payout_tat < 172801 THEN 'N:1–2 days'
+      WHEN payout_tat < 259201 THEN 'O:2–3 days'
+      WHEN payout_tat < 604801 THEN 'P:3–7 days'
+      ELSE 'Q:More than 7 days' end as tat_bucket,
+      
+      case 
+      when destination_amount > 1000000 then 'A:>1M'
+      when destination_amount > 100000 then 'B:>100k'
+      when destination_amount > 10000 then 'C:>1000'
+      when destination_amount > 1000 then 'D:>1000' 
+      else 'E: <= 1000'
+      end as dest_amt_bucket
+      from final 
+      
+      
+  
+       
