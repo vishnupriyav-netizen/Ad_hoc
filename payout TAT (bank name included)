@@ -4,7 +4,9 @@ with payout_filtered as
   SELECT 
     *
   FROM datalake.clean_payout
-  where date(created_at)> DATE('2025-11-01') AND status = 'succeeded'
+  where 
+  -- date(created_at)> DATE('2025-11-01') AND 
+  status = 'succeeded'
   ),
 
     
@@ -18,7 +20,7 @@ with payout_filtered as
         row_number() OVER (PARTITION BY payout_id ORDER BY created_at asc) AS first_provider_filter,
         row_number() OVER (PARTITION BY payout_id ORDER BY created_at DESC) AS final_provider_filter
     FROM datalake.clean_payout_attempt
-    WHERE date(created_at)> DATE('2025-10-01')
+    -- WHERE date(created_at)> DATE('2025-10-01')
     ),
     
     
@@ -29,7 +31,7 @@ payout_attempt_dm as (
   ROW_NUMBER() OVER (PARTITION BY payout_id ORDER BY payout_created_at DESC) as row_num
   
   from datamart_payout 
-  Where date(payout_created_at)> DATE('2025-11-01')
+  -- Where date(payout_created_at)> DATE('2025-11-01')
     ), 
     
     
@@ -60,7 +62,13 @@ payout_attempt_transition_filtered as
      
     bank_fetch as (
     select a.beneficiary as beneficiary_id, a.bank_id, JSONExtractString(
-        arrayFirst(x -> JSONExtractString(x, 'key') = 'bank_name', JSONExtractArrayRaw(bank_fields)),'value') as bank_name
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'bank_name', JSONExtractArrayRaw(bank_fields)),'value') as bank_name, 
+        
+        
+        
+    JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'ifsc_code', JSONExtractArrayRaw(bank_fields)),'value') as ifsc_code
+      
     from 
     (select beneficiary, bank_id from datalake.clean_beneficiary_bank 
     where beneficiary in (select beneficiary_id from payout_attempt_dm)) a 
@@ -93,6 +101,7 @@ payout_attempt_transition_filtered as
         e.destination_amount,
         e.fund_transfer_network as fund_transfer_network,
         d.bank_name,
+        d.ifsc_code,
         e.payout_currency, 
         e.payout_amount, 
         e.rate_in_pcy_to_usd,
@@ -131,6 +140,7 @@ payout_attempt_transition_filtered as
         fund_transfer_network,
         transfer_type,
         charge_type,
+        ifsc_code,
         case when bank_name <> '' then bank_name else bank_info end as bankname,
         TPV_USD,
            first_provider_filter,
@@ -145,7 +155,7 @@ payout_attempt_transition_filtered as
         MAX(end_date_1) as end_date,
         dateDiff('second', MIN(start_date_1), MAX(end_date_1)) AS payout_tat
        FROM combined_data
-    Group by 1,2,3,4,5,6,7,8,9,10)
+    Group by 1,2,3,4,5,6,7,8,9,10,11)
     
     
     select 
@@ -176,7 +186,7 @@ payout_attempt_transition_filtered as
       when destination_amount > 1000 then 'D:>1000' 
       else 'E: <= 1000'
       end as dest_amt_bucket
-      from final 
+      from final limit 10
    
       
       
