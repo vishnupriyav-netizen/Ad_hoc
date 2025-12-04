@@ -1,0 +1,21 @@
+-- merchants with the highest rate of failures / reversals
+-- merchnats and number of payouts attempted, their failures,  their reversal rates for past 1 year. take all of 2025 data 
+
+
+select business_name, seller_email, count(distinct payout_id) as num_payouts_attempted,
+count(distinct b.payout_attempt_id) as num_reversal,
+ count(distinct case when payout_attempt_status = 'failed' then payout_id end) as num_payouts_failed,
+count(distinct case when payout_attempt_status = 'failed' then payout_id end)/ count(distinct payout_id)  as percent_failed
+
+from datamart_payout  a 
+left join (select payout_attempt_id from datalake.clean_payout_attempt_status_transition where "from" = 'succeeded' and "to" = 'failed') b 
+on a.payout_attempt_id = b.payout_attempt_id
+
+
+
+where date(payout_created_at) >= date('2024-01-01') and LOWER(TRIM(seller_email)) not like '%tazapay.com'
+-- or seller_email not like '%digitrade.com')
+group by 1,2
+
+
+select "from", "to", count(*) from datalake.clean_payout_attempt_status_transition group by 1,2
