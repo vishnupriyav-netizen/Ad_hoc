@@ -5,13 +5,20 @@
 select business_name, seller_email, count(distinct payout_id) as num_payouts_attempted,
 count(distinct b.payout_attempt_id) as num_reversal,
  count(distinct case when payout_attempt_status = 'failed' then payout_id end) as num_payouts_failed,
-count(distinct case when payout_attempt_status = 'failed' then payout_id end)/ count(distinct payout_id)  as percent_failed
-
+count(distinct case when payout_attempt_status = 'failed' then payout_id end)/ count(distinct payout_id)  as percent_failed,
+AVG(CASE
+    WHEN payout_currency in ('usd', 'USD') then payout_amount / 100.0
+   WHEN payout_currency in ('btc','BTC') then (payout_amount / 100000000.0) * cast(rate_in_pcy_to_usd as Float64)
+    ELSE (payout_amount / 100.0) * CAST(rate_in_pcy_to_usd AS Float64)
+    END ) as avg_payout_tpv,
+sum(CASE
+    WHEN payout_currency in ('usd', 'USD') then payout_amount / 100.0
+   WHEN payout_currency in ('btc','BTC') then (payout_amount / 100000000.0) * cast(rate_in_pcy_to_usd as Float64)
+    ELSE (payout_amount / 100.0) * CAST(rate_in_pcy_to_usd AS Float64)
+    END ) as total_payout_tpv
 from datamart_payout  a 
 left join (select payout_attempt_id from datalake.clean_payout_attempt_status_transition where "from" = 'succeeded' and "to" = 'failed') b 
 on a.payout_attempt_id = b.payout_attempt_id
-
-
 
 where date(payout_created_at) >= date('2024-01-01') and LOWER(TRIM(seller_email)) not like '%tazapay.com'
 -- or seller_email not like '%digitrade.com')
