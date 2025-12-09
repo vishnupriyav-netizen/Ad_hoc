@@ -1,0 +1,36 @@
+select d.beneficiary_id as beneficiary_id, a.bank_id, b.payout_attempt_status, b.seller_email,
+a.country_code, 
+JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'account_holder_name', JSONExtractArrayRaw(bank_fields)),'value') as account_holder_name, 
+        
+JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'account_number', JSONExtractArrayRaw(bank_fields)),'value') as account_number, 
+
+JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'aba_code', JSONExtractArrayRaw(bank_fields)),'value') as aba_code, 
+
+JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'swift_code', JSONExtractArrayRaw(bank_fields)),'value') as swift_code, 
+        
+JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'bic_code', JSONExtractArrayRaw(bank_fields)),'value') as bic_code, 
+        
+JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'bsb_code', JSONExtractArrayRaw(bank_fields)),'value') as bsb_code, 
+        
+JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'iban', JSONExtractArrayRaw(bank_fields)),'value') as iban,     
+        
+        
+    JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'ifsc_code', JSONExtractArrayRaw(bank_fields)),'value') as ifsc_code
+      
+    from datalake.clean_bank a 
+    left join datamart_payout b on a.bank_id = b.bank_id 
+    left join datalake.clean_beneficiary_bank c on a.bank_id = c.bank_id
+    left join datalake.clean_beneficiary d on c.beneficiary = d.beneficiary_id
+    where seller_email not like '%tazapay.com' or seller_email not like '%digitrade.com'
+
+    
+    
+  
