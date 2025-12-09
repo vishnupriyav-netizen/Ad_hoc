@@ -29,7 +29,33 @@ JSONExtractString(
     left join datamart_payout b on a.bank_id = b.bank_id 
     left join datalake.clean_beneficiary_bank c on a.bank_id = c.bank_id
     left join datalake.clean_beneficiary d on c.beneficiary = d.beneficiary_id
-    where seller_email not like '%tazapay.com' or seller_email not like '%digitrade.com'
+    where seller_email not like '%tazapay.com' or seller_email not like '%digitrade.com' and 
+    country_code in (
+    'US',
+'IN',
+'ID',
+'VN',
+'NG',
+'NP',
+'PK',
+'PK',
+'CN',
+'GB',
+'GB',
+'KR',
+'BD',
+'BR',
+'MX',
+'UG',
+'AR',
+'BE',
+'IT',
+'UY',
+'PE',
+'MY',
+'TR',
+'ZA')
+    order by b.payout_created_at desc
 
     
     
