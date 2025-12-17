@@ -1,0 +1,28 @@
+
+
+
+    
+    
+    with bank_fetch as (
+    select distinct JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'bank_name', JSONExtractArrayRaw(bank_fields)),'value') as bank_name
+        
+        
+      
+    from 
+    (select beneficiary, bank_id from datalake.clean_bexneficiary_bank 
+    where beneficiary in (select beneficiary_id from datamart_payout)) a 
+    left join datalake.clean_bank b on a.bank_id = b.bank_id
+    
+    ),
+    
+    joins as (
+    select a.bank_name as all_bank, b.bank_name, b.final_bank_name from bank_fetch a 
+    left join dlt.gsheet_std_bank_name b
+    on a.bank_name = b.bank_name)
+    
+    select all_bank from joins where b.bank_name is null
+    
+    
+    
+    
