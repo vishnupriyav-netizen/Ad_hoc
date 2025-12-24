@@ -1,0 +1,351 @@
+Select 
+payout_id, account_id,  destination_country, transfer_type, tat_bucket, dest_amt_bucket as dest_amt_bucket_in_dest_currency, start_date, auto_manual, b.failure_code, b.error_code
+ from (
+with payout_filtered as
+(
+  SELECT 
+    *
+  FROM datalake.clean_payout
+  where date(created_at)> DATE('2025-05-01') AND status = 'succeeded'
+  ),
+  
+  payout_attempt_filtered as
+  (
+    SELECT
+        payout_attempt_id,
+        payout_id,
+        provider,
+        row_number() OVER (PARTITION BY payout_id ORDER BY created_at asc) AS first_provider_filter,
+        row_number() OVER (PARTITION BY payout_id ORDER BY created_at DESC) AS final_provider_filter
+    FROM datalake.clean_payout_attempt
+    WHERE date(created_at)> DATE('2025-05-01') 
+    ),
+    first_provider as 
+    (
+    SELECT
+        payout_id,
+        provider
+    FROM payout_attempt_filtered
+    where first_provider_filter =1
+    ),
+    final_provider as 
+    (
+    SELECT
+        payout_id,
+        provider
+    FROM payout_attempt_filtered
+    where final_provider_filter =1
+    ),  
+    
+    
+    payout_attempt_transition_filtered as 
+    (
+      SELECT
+        payout_attempt_id,
+        CASE WHEN created_by = 'system' THEN 1 ELSE 0 END as auto_flag,
+        CASE WHEN created_by <> 'system' THEN 1 ELSE 0 END as manual_flag,
+        created_at
+      FROM datalake.clean_payout_attempt_status_transition
+      Where date(created_at)> DATE('2025-05-01') 
+     ),
+     
+     transition_data as  
+     (
+     SELECT
+        payout_attempt_id,
+        SUM(auto_flag) as auto_flag_sum,
+        sum(manual_flag) as manual_flag_sum,
+        MIN(created_at) as start_date_1,
+        MAX(created_at) as end_date_1
+     FROM payout_attempt_transition_filtered
+     Group by 1 
+     ),
+     
+   combined_data as 
+   (
+      Select
+        a.payout_id as payout_id,
+        a.account_id,
+        a.beneficiary_id,
+        a.user_id,
+        a.currency,
+        a.amount,
+        a.holding_currency,
+        a.transfer_type,
+        a.charge_type,
+        a.status,
+        b.provider,
+        c.payout_attempt_id as payout_attempt_id,
+        c.auto_flag_sum,
+        c.manual_flag_sum,
+        c.start_date_1,
+        c.end_date_1,
+        d.provider as first_provider,
+        e.provider as final_provider
+      FROM payout_filtered a 
+      LEFT JOIN payout_attempt_filtered b 
+      ON a.payout_id = b.payout_id
+      LEFT JOIN transition_data c
+      on b.payout_attempt_id = c.payout_attempt_id
+      LEFT JOIN first_provider d  
+      on a.payout_id = d.payout_id
+      LEFT JOIN final_provider e  
+      On a.payout_id = e.payout_id
+      )
+  
+      ,
+      
+      final_a as (
+      select
+        payout_id,
+        account_id,
+        beneficiary_id,
+        user_id,
+        currency,
+        amount,
+        holding_currency,
+        transfer_type,
+        charge_type,
+        status,
+        first_provider,
+        final_provider,
+        COUNT(payout_attempt_id) as count_of_attempt,
+        CASE 
+            WHEN SUM(auto_flag_sum)> 0 AND SUM(manual_flag_sum)> 0 THEN 'both'
+            WHEN SUM(auto_flag_sum)> 0 AND SUM(manual_flag_sum)= 0 THEN 'auto'
+            ELSE 'manual'
+        END as auto_manual,
+        MIN(start_date_1) as start_date,
+        MAX(end_date_1) as end_date,
+        dateDiff('second', MIN(start_date_1), MAX(end_date_1)) AS payout_tat
+       FROM combined_data
+      
+    Group by 1,2,3,4,5,6,7,8,9,10,11,12
+      
+      ),
+      
+      
+      payout_attempt_dm as (
+  select 
+payout_id, payout_attempt_id, final_rail_used as provider, fund_transfer_network,  destination_currency, destination_country,
+  destination_amount ,rate_in_pcy_to_usd, payout_currency,payout_amount, beneficiary_id, local_payment_network_id, 
+  CASE
+    WHEN payout_attempt_status = 'succeeded' and payout_currency in ('usd', 'USD') then payout_amount / 100.0
+   WHEN payout_attempt_status = 'succeeded' and payout_currency in ('btc','BTC') then (payout_amount / 100000000.0) * cast(rate_in_pcy_to_usd as Float64)
+    when payout_attempt_status = 'succeeded' then (payout_amount / 100.0) * CAST(rate_in_pcy_to_usd AS Float64) else null
+    END  as TPV_USD
+
+  from datamart_payout where payout_attempt_status = 'succeeded'
+  -- Where date(payout_created_at)> DATE('2025-11-01')
+    )
+    
+      
+    ,
+    
+    
+    bank_fetch as (
+    select a.beneficiary as beneficiary_id, a.bank_id, JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'bank_name', JSONExtractArrayRaw(bank_fields)),'value') as bank_name, 
+        
+        
+        
+    JSONExtractString(
+        arrayFirst(x -> JSONExtractString(x, 'key') = 'ifsc_code', JSONExtractArrayRaw(bank_fields)),'value') as ifsc_code
+      
+    from 
+    (select beneficiary, bank_id from datalake.clean_beneficiary_bank 
+    where beneficiary in (select beneficiary_id from payout_attempt_dm)) a 
+    left join datalake.clean_bank b on a.bank_id = b.bank_id
+    
+    ), 
+    
+    lpn_data as (
+    select local_payment_network_id, substringIndex(deposit_key, '@', -1)  as bank_info 
+    from datalake.clean_local_payment_network 
+    where currency = 'INR' 
+    
+    ),
+      -- select * from final_a   where payout_id = 'pot_d4jo1hrvo68kujqeq9ag'
+      
+    final_b as (
+      select 
+            a.payout_id,
+        a.account_id,
+        a.beneficiary_id,
+        a.user_id,
+        a.currency,
+        a.amount,
+        a.holding_currency,
+        a.transfer_type,
+        a.charge_type,
+        a.status,
+        a.first_provider,
+        a.final_provider, a.count_of_attempt, a.auto_manual, a.start_date, a.end_date, a.payout_tat,
+      e.destination_amount,
+        e.fund_transfer_network as fund_transfer_network,
+        d.bank_name,
+        CASE 
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'sbin' THEN 'State Bank of India'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'hdfc' THEN 'HDFC Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'icic' THEN 'ICICI Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'kkbk' THEN 'Kotak Mahindra Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'utib' THEN 'Axis Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'barb' THEN 'Bank of Baroda'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'punb' THEN 'Punjab National Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'ubin' THEN 'Union Bank of India'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'cnrb' THEN 'Canara Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'indb' THEN 'IndusInd Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'bkid' THEN 'Bank of India'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'idfb' THEN 'IDFC First Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'idib' THEN 'IDBI Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'yesb' THEN 'Yes Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'cbin' THEN 'Central Bank of India'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'fdrl' THEN 'Federal Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'jaka' THEN 'Jammu & Kashmir Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'ioba' THEN 'Indian Overseas Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'aubl' THEN 'AU Small Finance Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'mahb' THEN 'Bank of Maharashtra'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'ucba' THEN 'UCO Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'ratn' THEN 'RBL Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'esfb' THEN 'ESAF Small Finance Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'dbss' THEN 'DBS Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'karb' THEN 'Karnataka Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'bdbl' THEN 'Bandhan Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'scbl' THEN 'Standard Chartered Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'psib' THEN 'Punjab & Sind Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'kvbl' THEN 'Karur Vysya Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'hsbc' THEN 'HSBC Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'fino' THEN 'Fino Payments Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'srcb' THEN 'Saraswat Co-operative Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'tmbl' THEN 'Tamilnad Mercantile Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'sibl' THEN 'South Indian Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'dcbl' THEN 'DCB Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'citi' THEN 'Citibank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'pytm' THEN 'Paytm Payments Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'jiop' THEN 'Jio Payments Bank'
+        WHEN lower(substring(ifsc_code, 1, 4)) = 'ipos' THEN 'India Post Payments Bank'
+        ELSE null end as ifsc_code_st,
+        e.payout_currency, 
+        e.payout_amount, 
+        e.rate_in_pcy_to_usd,
+        e.TPV_USD,
+        CASE 
+    -- 10-character patterns (most specific)
+    WHEN lower(substring(bank_info, 1, 10)) = 'okhdfcbank' THEN 'HDFC Bank'
+    WHEN lower(substring(bank_info, 1, 10)) = 'fifederal' THEN 'Federal Bank'
+    WHEN lower(substring(bank_info, 1, 10)) = 'idfcfirst' THEN 'IDFC First Bank'
+    WHEN lower(substring(bank_info, 1, 10)) = 'unionbank' THEN 'Union Bank of India'
+    WHEN lower(substring(bank_info, 1, 10)) = 'barodapay' THEN 'Bank of Baroda'
+    
+    -- 8-character patterns
+    WHEN lower(substring(bank_info, 1, 8)) = 'axisbank' THEN 'Axis Bank'
+    
+    -- 7-character patterns
+    WHEN lower(substring(bank_info, 1, 7)) = 'okicici' THEN 'ICICI Bank'
+    WHEN lower(substring(bank_info, 1, 7)) = 'okkotak' THEN 'Kotak Mahindra Bank'
+    WHEN lower(substring(bank_info, 1, 7)) = 'yescred' THEN 'Yes Bank'
+    WHEN lower(substring(bank_info, 1, 7)) = 'yesbank' THEN 'Yes Bank'
+    WHEN lower(substring(bank_info, 1, 7)) = 'federal' THEN 'Federal Bank'
+    
+    -- 6-character patterns
+    WHEN lower(substring(bank_info, 1, 6)) = 'okaxis' THEN 'Axis Bank'
+    WHEN lower(substring(bank_info, 1, 6)) = 'pthdfc' THEN 'HDFC Bank'
+    WHEN lower(substring(bank_info, 1, 6)) = 'indus' THEN 'IndusInd Bank'
+    WHEN lower(substring(bank_info, 1, 6)) = 'canara' THEN 'Canara Bank'
+    
+    -- 5-character patterns
+    WHEN lower(substring(bank_info, 1, 5)) = 'oksbi' THEN 'State Bank of India'
+    WHEN lower(substring(bank_info, 1, 5)) = 'ptsbi' THEN 'State Bank of India'
+    WHEN lower(substring(bank_info, 1, 5)) = 'kotak' THEN 'Kotak Mahindra Bank'
+    WHEN lower(substring(bank_info, 1, 5)) = 'ptyes' THEN 'Yes Bank'
+    WHEN lower(substring(bank_info, 1, 5)) = 'icici' THEN 'ICICI Bank'
+    WHEN lower(substring(bank_info, 1, 5)) = 'paytm' THEN 'Paytm Payments Bank'
+    
+    -- 4-character patterns
+    WHEN lower(substring(bank_info, 1, 4)) = 'hdfc' THEN 'HDFC Bank'
+    WHEN lower(substring(bank_info, 1, 4)) = 'axis' THEN 'Axis Bank'
+    WHEN lower(substring(bank_info, 1, 4)) = 'uboi' THEN 'Union Bank of India'
+    WHEN lower(substring(bank_info, 1, 4)) = 'idfc' THEN 'IDFC First Bank'
+    WHEN lower(substring(bank_info, 1, 4)) = 'barb' THEN 'Bank of Baroda'
+    WHEN lower(substring(bank_info, 1, 4)) = 'punb' THEN 'Punjab National Bank'
+    WHEN lower(substring(bank_info, 1, 4)) = 'cnrb' THEN 'Canara Bank'
+    WHEN lower(substring(bank_info, 1, 4)) = 'bkid' THEN 'Bank of India'
+    WHEN lower(substring(bank_info, 1, 4)) = 'idbi' THEN 'IDBI Bank'
+    WHEN lower(substring(bank_info, 1, 4)) = 'idib' THEN 'IDBI Bank'
+    WHEN lower(substring(bank_info, 1, 4)) = 'jiop' THEN 'Jio Payments Bank'
+    WHEN lower(substring(bank_info, 1, 4)) = 'pytm' THEN 'Paytm Payments Bank'
+    
+    -- 3-character patterns
+    WHEN lower(substring(bank_info, 1, 3)) = 'ybl' THEN 'PhonePe (Multi-Bank UPI)'
+    WHEN lower(substring(bank_info, 1, 3)) = 'ibl' THEN 'IndusInd Bank'
+    WHEN lower(substring(bank_info, 1, 3)) = 'dbs' THEN 'DBS Bank'
+    WHEN lower(substring(bank_info, 1, 3)) = 'sbi' THEN 'State Bank of India'
+    WHEN lower(substring(bank_info, 1, 3)) = 'axl' THEN 'Axis Bank'
+    WHEN lower(substring(bank_info, 1, 3)) = 'pnb' THEN 'Punjab National Bank'
+    WHEN lower(substring(bank_info, 1, 3)) = 'boi' THEN 'Bank of India'
+    WHEN lower(substring(bank_info, 1, 3)) = 'jio' THEN 'Jio Payments Bank'
+    end as bank_info_st,
+          e.destination_currency,
+          e.destination_country,
+      
+      
+      from final_a a 
+      
+      left join payout_attempt_dm e 
+      on a.payout_id = e.payout_id 
+      
+      
+      left join bank_fetch d 
+      on e.beneficiary_id = d.beneficiary_id
+      
+      left join lpn_data f
+      on e.local_payment_network_id = f.local_payment_network_id) ,
+      
+      final_c as (
+      
+      
+    select 
+    *,
+    CASE
+    WHEN payout_tat < 60 THEN 'A: 0-1 min'
+    WHEN payout_tat < 120 THEN 'B: 1-2 min'
+    WHEN payout_tat < 180 THEN 'C: 2-3 min'
+    WHEN payout_tat < 240 THEN 'D: 3-4 min'
+    WHEN payout_tat < 300 THEN 'E: 4-5 min'
+    WHEN payout_tat < 360 THEN 'F: 5-6 min'
+    WHEN payout_tat < 420 THEN 'G: 6-7 min'
+    WHEN payout_tat < 480 THEN 'H: 7-8 min'
+    WHEN payout_tat < 540 THEN 'I: 8-9 min'
+    WHEN payout_tat < 600 THEN 'J: 9-10 min'
+    WHEN payout_tat < 660 THEN 'K: 10-11 min'
+    WHEN payout_tat < 720 THEN 'L: 11-12 min'
+    WHEN payout_tat < 780 THEN 'M: 12-13 min'
+    WHEN payout_tat < 840 THEN 'N: 13-14 min'
+    WHEN payout_tat < 900 THEN 'O: 14-15 min'
+    WHEN payout_tat < 1200 THEN 'P: 15-20 min'
+    WHEN payout_tat < 1500 THEN 'Q: 20-25 min'
+    WHEN payout_tat < 1800 THEN 'R: 25-30 min'
+    WHEN payout_tat < 2400 THEN 'S: 30-40 min'
+    WHEN payout_tat < 3600 THEN 'T: 40-60 min'
+    WHEN payout_tat < 21600 THEN 'U: 60 min - 6 hours'
+    WHEN payout_tat < 86400 THEN 'V: 6 hours - 24 hours'
+    WHEN payout_tat < 172800 THEN 'W: 24 hours - 48 hours'
+    ELSE 'X: > 48 hours'
+END AS tat_bucket,
+      case 
+      when destination_amount > 1000000 then 'A:>1M'
+      when destination_amount > 100000 then 'B:>100k'
+      when destination_amount > 10000 then 'C:>1000'
+      when destination_amount > 1000 then 'D:>1000' 
+      else 'E: <= 1000'
+      end as dest_amt_bucket
+
+      from final_b 
+      ) 
+      select * from final_c
+      ) a
+      
+  
+    
+      left join datamart_payout b on a.payout_id = b.payout_id 
+      where  toDate(start_date) >= toDate('2025-11-20') and payout_tat > 1200
